@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -62,6 +63,23 @@ class SearchResponse(BaseModel):
     summary: str
     search_results: Optional[dict] = None
     sources_count: int
+    error: Optional[str] = None
+
+
+class HyperliquidAsset(BaseModel):
+    name: str
+    funding_rate: float
+    annualized_return: float
+    mark_price: float
+    open_interest: float
+    day_volume: float
+    liquidity_usd: float
+    premium: float
+
+
+class HyperliquidDataResponse(BaseModel):
+    success: bool
+    assets: List[HyperliquidAsset]
     error: Optional[str] = None
 
 
@@ -234,6 +252,77 @@ async def get_agent_capabilities(request: Request):
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Error getting capabilities")
         return {"success": False, "error": str(exc)}
+
+
+@api_router.get("/hyperliquid/data", response_model=HyperliquidDataResponse)
+async def get_hyperliquid_data():
+    """
+    Fetch real-time funding rates and asset data from Hyperliquid API.
+    Returns processed data with annualized returns and liquidity in USD.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Fetch metadata and asset contexts (funding, price, OI, etc.)
+            response = await client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "metaAndAssetCtxs"},
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if not isinstance(data, list) or len(data) < 2:
+                raise ValueError("Unexpected API response format")
+
+            universe = data[0].get("universe", [])
+            asset_ctxs = data[1]
+
+            if len(universe) != len(asset_ctxs):
+                raise ValueError("Mismatch between universe and asset contexts")
+
+            # Process assets
+            assets = []
+            for idx, asset_info in enumerate(universe):
+                asset_ctx = asset_ctxs[idx]
+
+                try:
+                    name = asset_info.get("name", "")
+                    funding_rate = float(asset_ctx.get("funding") or "0")
+                    mark_price = float(asset_ctx.get("markPx") or "0")
+                    open_interest = float(asset_ctx.get("openInterest") or "0")
+                    day_volume = float(asset_ctx.get("dayNtlVlm") or "0")
+                    premium = float(asset_ctx.get("premium") or "0")
+
+                    # Calculate annualized return (funding is hourly, so * 24 * 365)
+                    annualized_return = funding_rate * 24 * 365 * 100
+
+                    # Calculate liquidity in USD (OI * mark price)
+                    liquidity_usd = open_interest * mark_price
+
+                    assets.append(
+                        HyperliquidAsset(
+                            name=name,
+                            funding_rate=funding_rate,
+                            annualized_return=annualized_return,
+                            mark_price=mark_price,
+                            open_interest=open_interest,
+                            day_volume=day_volume,
+                            liquidity_usd=liquidity_usd,
+                            premium=premium,
+                        )
+                    )
+                except (ValueError, TypeError) as exc:
+                    logger.warning(f"Skipping asset {asset_info.get('name', 'unknown')}: {exc}")
+                    continue
+
+            return HyperliquidDataResponse(success=True, assets=assets)
+
+    except httpx.HTTPError as exc:
+        logger.exception("HTTP error fetching Hyperliquid data")
+        return HyperliquidDataResponse(success=False, assets=[], error=f"HTTP error: {str(exc)}")
+    except Exception as exc:
+        logger.exception("Error fetching Hyperliquid data")
+        return HyperliquidDataResponse(success=False, assets=[], error=str(exc))
 
 
 app.include_router(api_router)
